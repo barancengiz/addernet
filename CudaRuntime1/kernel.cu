@@ -11,6 +11,7 @@
 #define DEBUG_IMG_IDX 20
 // AdderNET kernel size
 #define KERNEL_RADIUS 1
+#define KERNEL_SIZE 9
 
 typedef unsigned char uint8_t;
 
@@ -20,6 +21,8 @@ typedef unsigned char uint8_t;
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 #define GPUTHREADSIZE 1024
+
+__constant__ uint8_t addernet_const_kernel[KERNEL_SIZE];
 
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
     if (code != cudaSuccess) {
@@ -40,7 +43,7 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, int kerne
 // using square kernels like 5x5 (radius 2), 11x11 (radius 5)
 // Single input & output channels
 __global__ void
-addernetKernel(uint8_t *dev_out, const uint8_t *dev_img, const uint8_t *addernet_kernel, const int kernel_radius,
+addernetKernel(uint8_t *dev_out, const uint8_t *dev_img, const int kernel_radius,
                const int img_width, const int imgHeigth) {
 
     unsigned int tid_x = threadIdx.x;
@@ -60,7 +63,7 @@ addernetKernel(uint8_t *dev_out, const uint8_t *dev_img, const uint8_t *addernet
             if (col + kernel_length <= img_width && row + kernel_length <= imgHeigth) {
 //                int i1 = abs(dev_img[(row + j) * img_width + col + i] - addernet_kernel[j * kernel_length + i]);
 //                uint8_t i2 = dev_img[(row + j) * img_width + col + i] * addernet_kernel[j * kernel_length + i];
-                accumulator += dev_img[(row + j) * img_width + col + i] * addernet_kernel[j * kernel_length + i];
+                accumulator += dev_img[(row + j) * img_width + col + i] * addernet_const_kernel[j * kernel_length + i];
             }
         }
     }
@@ -169,18 +172,19 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, const int
     gpuErrchk(cudaMalloc((void **) &dev_img, img_width * img_length * sizeof(uint8_t)))
     gpuErrchk(cudaMalloc((void **) &dev_out,
                          (img_width - 2 * kernel_radius) * (img_length - 2 * kernel_radius) * sizeof(uint8_t)))
-    gpuErrchk(cudaMalloc((void **) &dev_addernet_kernel, pow(2 * kernel_radius + 1, 2) * sizeof(uint8_t)))
+
+    // Initialize constant memory in GPU
+    gpuErrchk(cudaMemcpyToSymbol(addernet_const_kernel, addernet_kernel, sizeof(uint8_t) * KERNEL_SIZE));
+
     // Copy the image from host memory to GPU.
     gpuErrchk(cudaMemcpy(dev_img, img, img_width * img_length * sizeof(uint8_t), cudaMemcpyHostToDevice));
-    gpuErrchk(cudaMemcpy(dev_addernet_kernel, addernet_kernel, pow(2 * kernel_radius + 1, 2) * sizeof(uint8_t),
-                         cudaMemcpyHostToDevice));
 
 
     dim3 grid, block;
     block.x = blockSize;
     grid.x = gridSize;
 
-    addernetKernel <<<grid, block >>>(dev_out, dev_img, dev_addernet_kernel, kernel_radius, img_width, img_length);
+    addernetKernel <<<grid, block >>>(dev_out, dev_img, kernel_radius, img_width, img_length);
     gpuErrchk(cudaGetLastError())
     // Copy output vector from GPU buffer to host memory.
     cudaStatus = cudaMemcpy(out_img, dev_out,
