@@ -1,4 +1,4 @@
-﻿#include "cuda_runtime.h"
+#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
 #include <cstdio>
@@ -11,7 +11,7 @@
 #define DEBUG_IMG_IDX 20
 // AdderNET kernel size
 #define KERNEL_RADIUS 1
-#define KERNEL_SIZE 9   // number of elements in the kernel
+#define KERNEL_SIZE 9
 
 typedef unsigned char uint8_t;
 
@@ -43,7 +43,7 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, int kerne
 // using square kernels like 5x5 (radius 2), 11x11 (radius 5)
 // Single input & output channels
 __global__ void
-addernetKernel(uint8_t *dev_out, cudaTextureObject_t dev_img, const int kernel_radius,
+addernetKernel(uint8_t *dev_out, const uint8_t *dev_img, const int kernel_radius,
                const int img_width, const int imgHeigth) {
 
     unsigned int tid_x = threadIdx.x;
@@ -63,7 +63,7 @@ addernetKernel(uint8_t *dev_out, cudaTextureObject_t dev_img, const int kernel_r
             if (col + kernel_length <= img_width && row + kernel_length <= imgHeigth) {
 //                int i1 = abs(dev_img[(row + j) * img_width + col + i] - addernet_kernel[j * kernel_length + i]);
 //                uint8_t i2 = dev_img[(row + j) * img_width + col + i] * addernet_kernel[j * kernel_length + i];
-                accumulator += tex2D<uint8_t>(dev_img, col + i, row + j) * addernet_const_kernel[j * kernel_length + i];
+                accumulator += dev_img[(row + j) * img_width + col + i] * addernet_const_kernel[j * kernel_length + i];
             }
         }
     }
@@ -81,7 +81,7 @@ int main() {
     float total_time = 0;
     // Load a grayscale bmp image to an unsigned integer array with its height and weight.
     //  (uint8_t is an alias for "unsigned char")
-    for (int run = 0; run < 1; run++) {
+    for (int run = 0; run < 100; run++) {
         uint8_t *image = stbi_load("../CudaRuntime1/samples/640x426.bmp", &width, &height, &bpp, NUM_CHANNELS);
 
         // Print for sanity check
@@ -156,67 +156,40 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, const int
     int blockSize = NUM_THREADS;
     int gridSize = img_width * img_length / blockSize + (img_width * img_length % blockSize != 0);
 
-    // Device memory pointers for image
+    // Temp CPU array that hold min values of each block. We need half of the gridSize since
+    uint8_t *min_array;
+    min_array = (uint8_t *) malloc(ceil(gridSize / 2) * sizeof(uint8_t));
+    // Device memory pointers for image and block minima
+    uint8_t *dev_img;
     uint8_t *dev_out;
     uint8_t *dev_addernet_kernel;
     cudaError_t cudaStatus;
-    cudaArray_t cuArray;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
 //    gpuErrchk(cudaSetDevice(0));
 
-     // CUDA Channel Descriptor
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 0, 0, 0, cudaChannelFormatKindUnsigned);
-    
-    // Allocate CUDA array in device memory
-    gpuErrchk(cudaMallocArray(&cuArray, &channelDesc, img_width, img_length));
-
-    // Set pitch of the source (the width in memory in bytes of the 2D array pointed to by src
-    const size_t spitch = img_width * sizeof(uint8_t);
-
-    // Specify texture
-    cudaResourceDesc resDesc;
-    memset(&resDesc, 0, sizeof(resDesc));
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = cuArray;
-
-    // Specify texture object parameters
-    cudaTextureDesc texDesc;
-    memset(&texDesc, 0, sizeof(texDesc));
-    texDesc.addressMode[0] = cudaAddressModeClamp;
-    texDesc.addressMode[1] = cudaAddressModeClamp;
-    texDesc.filterMode = cudaFilterModePoint;
-    texDesc.readMode = cudaReadModeElementType;
-    texDesc.normalizedCoords = 0;
-
-    // Create texture object
-    cudaTextureObject_t texObj = 0;
-    gpuErrchk(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL));
-
-    // Copy data from host memory to CUDA array.
-    gpuErrchk(cudaMemcpy2DToArray(cuArray, 0, 0, img, spitch, img_width * sizeof(uint8_t), img_length, cudaMemcpyHostToDevice));
-
-    // Allocate GPU memory for the output
+    // Allocate GPU memory for the image and minima of seperate blocks
+    gpuErrchk(cudaMalloc((void **) &dev_img, img_width * img_length * sizeof(uint8_t)))
     gpuErrchk(cudaMalloc((void **) &dev_out,
                          (img_width - 2 * kernel_radius) * (img_length - 2 * kernel_radius) * sizeof(uint8_t)))
 
     // Initialize constant memory in GPU
     gpuErrchk(cudaMemcpyToSymbol(addernet_const_kernel, addernet_kernel, sizeof(uint8_t) * KERNEL_SIZE));
 
+    // Copy the image from host memory to GPU.
+    gpuErrchk(cudaMemcpy(dev_img, img, img_width * img_length * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+
     dim3 grid, block;
     block.x = blockSize;
     grid.x = gridSize;
 
-    addernetKernel <<<grid, block >>>(dev_out, texObj, kernel_radius, img_width, img_length);
+    addernetKernel <<<grid, block >>>(dev_out, dev_img, kernel_radius, img_width, img_length);
     gpuErrchk(cudaGetLastError())
     // Copy output vector from GPU buffer to host memory.
     cudaStatus = cudaMemcpy(out_img, dev_out,
                             (img_width - 2 * kernel_radius) * (img_length - 2 * kernel_radius) * sizeof(uint8_t),
                             cudaMemcpyDeviceToHost);
-
-    // Destroy texture object
-    gpuErrchk(cudaDestroyTextureObject(texObj));
-    gpuErrchk(cudaFree(dev_out));
 
     return cudaStatus;
 }
