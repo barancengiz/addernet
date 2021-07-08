@@ -33,7 +33,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort =
 
 cudaError_t
 addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, int kernel_radius, int img_width,
-             int img_length);
+             int img_height);
 
 // Assuming VALID padding (size decreases)
 // Index: kernel_radius -> img_width - kernel_radius - 1
@@ -58,7 +58,7 @@ addernetKernel(uint8_t *dev_out, const uint8_t *dev_img, const uint8_t *addernet
         for (size_t i = 0; i < kernel_length; i++) {
             // Read from global memory one by one. Shared memory can be used for optimization.
             if (col + kernel_length <= img_width && row + kernel_length <= imgHeigth) {
-//                int i1 = abs(dev_img[(row + j) * img_width + col + i] - addernet_kernel[j * kernel_length + i]);
+//                int i1 = -abs(dev_img[(row + j) * img_width + col + i] - addernet_kernel[j * kernel_length + i]);
 //                uint8_t i2 = dev_img[(row + j) * img_width + col + i] * addernet_kernel[j * kernel_length + i];
                 accumulator += dev_img[(row + j) * img_width + col + i] * addernet_kernel[j * kernel_length + i];
             }
@@ -69,7 +69,61 @@ addernetKernel(uint8_t *dev_out, const uint8_t *dev_img, const uint8_t *addernet
     }
     __syncthreads();
 }
+// Matrix summation where each thread covers an element each
+__global__ void mat_mean(const long *mean_vals, long *mean_outs, int tot_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= tot_size) return;
 
+    //Copy memory
+    extern __shared__ long means[];
+    means[threadIdx.x] = mean_vals[idx];
+
+    __syncthreads();
+
+    //Reduce max
+
+    int tid = threadIdx.x;
+    if (blockDim.x > 1) {
+        unsigned int lastDim = blockDim.x;
+        for (unsigned int i = (blockDim.x + 1) / 2; i >= 1; (++i) >>= 1) {
+            if (i == 1) {
+                means[0] += means[1];
+                __syncthreads();
+                break;
+            } else if (((lastDim & 0x1) == 1 && tid < (i - 1)) || (tid < i)) {
+                means[tid] += means[tid + i];
+            }
+//            if (vec_idx < i-1 && i!=1) {
+//                means[vec_idx] += means[vec_idx + i];
+//            } else if (i == 1) {
+//                means[0] += means[1];
+//                __syncthreads();
+//                break;
+//            }
+            (++lastDim) >>= 1;
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        mean_outs[blockIdx.x] = means[0];
+    }
+
+}
+
+__global__ void square_sum(const uint8_t *mean_vals, long *mean_outs, long mean, int tot_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= tot_size) return;
+    long diff = mean_vals[idx] - mean;
+    mean_outs[idx] = diff * diff;
+}
+
+__global__ void normalize(const uint8_t *img, uint8_t *out_img, long mean, long var, int tot_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= tot_size) return;
+    long diff = img[idx] - mean;
+    out_img[idx] = diff / sqrt(var);
+}
 
 int main() {
     int width; //image width
@@ -149,9 +203,9 @@ int main() {
 // Helper function for using CUDA to add vectors in parallel.
 cudaError_t
 addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, const int kernel_radius, const int img_width,
-             const int img_length) {
+             const int img_height) {
     int blockSize = NUM_THREADS;
-    int gridSize = img_width * img_length / blockSize + (img_width * img_length % blockSize != 0);
+    int gridSize = img_width * img_height / blockSize + (img_width * img_height % blockSize != 0);
 
     // Temp CPU array that hold min values of each block. We need half of the gridSize since
     uint8_t *min_array;
@@ -166,12 +220,14 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, const int
 //    gpuErrchk(cudaSetDevice(0));
 
     // Allocate GPU memory for the image and minima of seperate blocks
-    gpuErrchk(cudaMalloc((void **) &dev_img, img_width * img_length * sizeof(uint8_t)))
+    gpuErrchk(cudaMalloc((void **) &dev_img, img_width * img_height * sizeof(uint8_t)))
+    int width = img_width - 2 * kernel_radius;
+    int height = img_height - 2 * kernel_radius;
     gpuErrchk(cudaMalloc((void **) &dev_out,
-                         (img_width - 2 * kernel_radius) * (img_length - 2 * kernel_radius) * sizeof(uint8_t)))
+                         width * height * sizeof(uint8_t)))
     gpuErrchk(cudaMalloc((void **) &dev_addernet_kernel, pow(2 * kernel_radius + 1, 2) * sizeof(uint8_t)))
     // Copy the image from host memory to GPU.
-    gpuErrchk(cudaMemcpy(dev_img, img, img_width * img_length * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    gpuErrchk(cudaMemcpy(dev_img, img, img_width * img_height * sizeof(uint8_t), cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(dev_addernet_kernel, addernet_kernel, pow(2 * kernel_radius + 1, 2) * sizeof(uint8_t),
                          cudaMemcpyHostToDevice));
 
@@ -180,12 +236,100 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, const int
     block.x = blockSize;
     grid.x = gridSize;
 
-    addernetKernel <<<grid, block >>>(dev_out, dev_img, dev_addernet_kernel, kernel_radius, img_width, img_length);
+    addernetKernel <<<grid, block >>>(dev_out, dev_img, dev_addernet_kernel, kernel_radius, img_width, img_height);
     gpuErrchk(cudaGetLastError())
     // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(out_img, dev_out,
-                            (img_width - 2 * kernel_radius) * (img_length - 2 * kernel_radius) * sizeof(uint8_t),
-                            cudaMemcpyDeviceToHost);
 
+    int n_blocks = 0;
+    long *mean_h, *var_h;
+    long *mean_d, *var_d;
+
+
+    size_t tot_size_1 = width * height * sizeof(long);
+    cudaMalloc((void **) &mean_d, tot_size_1);
+    cudaMalloc((void **) &var_d, tot_size_1);
+    cudaMemset(mean_d, 0, tot_size_1);
+    cudaMemset(var_d, 0, tot_size_1);
+    for (int i = 0; i < width * height; i++) {
+        cudaMemcpy(mean_d + i, dev_out, 1, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(var_d + i, dev_out, 1, cudaMemcpyDeviceToDevice);
+    }
+    mean_h = (long *) malloc(sizeof(long));
+    var_h = (long *) malloc(sizeof(long));
+    int N = height * width;
+    do {
+        long *mean_temp_d;
+
+        int block_size = min(GPUTHREADSIZE, N);
+        n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+        size_t count = n_blocks * sizeof(long);
+        gpuErrchk(cudaMalloc((void **) &mean_temp_d, count));
+//        gpuErrchk(cudaMalloc((void **) &min_temp_d, count));
+        gpuErrchk(cudaMemset(mean_temp_d, 0, count));
+//        cudaMemset(min_temp_d, 255, count);
+        size_t i = block_size * sizeof(long);
+        mat_mean<<< n_blocks, block_size, i>>>(mean_d, mean_temp_d, N);
+        gpuErrchk(cudaGetLastError())
+//        mat_min <<< n_blocks, block_size, block_size >>>(min_d, min_temp_d, N);
+//        err = cudaGetLastError();
+//        gpuErrchk(err)
+        cudaDeviceSynchronize();
+//        gpuErrchk(cudaMemcpy(min_d, min_temp_d, count, cudaMemcpyDeviceToDevice));
+        gpuErrchk(cudaMemcpy(mean_d, mean_temp_d, count, cudaMemcpyDeviceToDevice));
+        cudaDeviceSynchronize();
+
+//        gpuErrchk(cudaFree(min_temp_d));
+        gpuErrchk(cudaFree(mean_temp_d));
+        N = n_blocks;
+    } while (n_blocks != 1);
+    cudaMemcpy(mean_h, mean_d, sizeof(long), cudaMemcpyDeviceToHost);
+//    cudaMemcpy(var_h, min_d, sizeof(long), cudaMemcpyDeviceToHost);
+    N = width * height;
+    *mean_h = *mean_h / N;
+    printf("mean: %d\n", *mean_h);
+    int block_size = min(GPUTHREADSIZE, N);
+    n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+    square_sum<<< n_blocks, block_size>>>(dev_out, var_d, *mean_h, N);
+
+    do {
+        long *mean_temp_d;
+
+        block_size = min(GPUTHREADSIZE, N);
+        n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+        size_t count = n_blocks * sizeof(long);
+        gpuErrchk(cudaMalloc((void **) &mean_temp_d, count));
+//        gpuErrchk(cudaMalloc((void **) &min_temp_d, count));
+        gpuErrchk(cudaMemset(mean_temp_d, 0, count));
+//        cudaMemset(min_temp_d, 255, count);
+        size_t i = block_size * sizeof(long);
+        mat_mean<<< n_blocks, block_size, i>>>(var_d, mean_temp_d, N);
+        gpuErrchk(cudaGetLastError())
+//        mat_min <<< n_blocks, block_size, block_size >>>(min_d, min_temp_d, N);
+//        err = cudaGetLastError();
+//        gpuErrchk(err)
+        cudaDeviceSynchronize();
+//        gpuErrchk(cudaMemcpy(min_d, min_temp_d, count, cudaMemcpyDeviceToDevice));
+        gpuErrchk(cudaMemcpy(var_d, mean_temp_d, count, cudaMemcpyDeviceToDevice));
+        cudaDeviceSynchronize();
+
+//        gpuErrchk(cudaFree(min_temp_d));
+        gpuErrchk(cudaFree(mean_temp_d));
+        N = n_blocks;
+    } while (n_blocks != 1);
+    cudaMemcpy(var_h, var_d, sizeof(long), cudaMemcpyDeviceToHost);
+//    cudaMemcpy(var_h, min_d, sizeof(long), cudaMemcpyDeviceToHost);
+    N = width * height;
+    printf("var: %d\n", *var_h);
+    *var_h = *var_h / N;
+    printf("var: %d\n", *var_h);
+
+    N = width * height;
+    block_size = min(GPUTHREADSIZE, N);
+    n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+    normalize<<< n_blocks, block_size>>>(dev_out, dev_out, *mean_h, *var_h, N);
+
+    cudaStatus = cudaMemcpy(out_img, dev_out,
+                            width * height * sizeof(uint8_t),
+                            cudaMemcpyDeviceToHost);
     return cudaStatus;
 }

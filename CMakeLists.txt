@@ -4,6 +4,7 @@ set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
 project(addernet CUDA CXX)
 
 set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fmad=false")
 
 add_executable(addernet-texture CudaRuntime1/kernel-addernet-texture.cu)
 
