@@ -10,8 +10,8 @@
 // Random sample from the image for debug purposes.
 #define DEBUG_IMG_IDX 20
 // AdderNET kernel size
-#define KERNEL_RADIUS 1
-#define KERNEL_SIZE 9   // number of elements in the kernel
+#define KERNEL_RADIUS 5
+#define KERNEL_SIZE (2*KERNEL_RADIUS+1)*(2*KERNEL_RADIUS+1)   // number of elements in the kernel
 
 typedef unsigned char uint8_t;
 
@@ -61,8 +61,9 @@ addernetKernel(uint8_t *dev_out, cudaTextureObject_t dev_img, const int kernel_r
         for (size_t i = 0; i < kernel_length; i++) {
             // Read from global memory one by one. Shared memory can be used for optimization.
             if (col + kernel_length <= img_width && row + kernel_length <= imgHeigth) {
-//                int i1 = abs(dev_img[(row + j) * img_width + col + i] - addernet_kernel[j * kernel_length + i]);
-//                uint8_t i2 = dev_img[(row + j) * img_width + col + i] * addernet_kernel[j * kernel_length + i];
+//                int i1 = -abs(tex2D<uint8_t>(dev_img, col + i, row + j) - addernet_const_kernel[j * kernel_length + i]);
+//                uint8_t i2 = tex2D<uint8_t>(dev_img, col + i, row + j) * addernet_const_kernel[j * kernel_length + i]
+//                accumulator += -abs(tex2D<uint8_t>(dev_img, col + i, row + j) - addernet_const_kernel[j * kernel_length + i]);
                 accumulator += tex2D<uint8_t>(dev_img, col + i, row + j) * addernet_const_kernel[j * kernel_length + i];
             }
         }
@@ -126,7 +127,7 @@ __global__ void normalize(const uint8_t *img, uint8_t *out_img, long mean, long 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= tot_size) return;
     long diff = img[idx] - mean;
-    out_img[idx] = diff / sqrt(var);
+    out_img[idx] = diff / sqrtf(float(var));
 }
 
 
@@ -137,8 +138,9 @@ int main() {
     float total_time = 0;
     // Load a grayscale bmp image to an unsigned integer array with its height and weight.
     //  (uint8_t is an alias for "unsigned char")
-    for (int run = 0; run < 100; run++) {
-        uint8_t *image = stbi_load("../CudaRuntime1/samples/640x426.bmp", &width, &height, &bpp, NUM_CHANNELS);
+    int num_of_runs = 10;
+    for (int run = 0; run < num_of_runs; run++) {
+        uint8_t *image = stbi_load("../CudaRuntime1/samples/5184x3456.bmp", &width, &height, &bpp, NUM_CHANNELS);
 
         // Print for sanity check
         printf("Bytes per pixel: %d \n", bpp / 3); //Image is grayscale, so bpp / 3;
@@ -193,7 +195,7 @@ int main() {
         }
 
         // Write image array into a bmp file
-        stbi_write_bmp("./out_img_640x426.bmp", width - 2 * kernel_radius, height - 2 * kernel_radius, 1, out_image);
+        stbi_write_bmp("./out_img_5184x3456.bmp", width - 2 * kernel_radius, height - 2 * kernel_radius, 1, out_image);
 
         // Deallocate memory
         stbi_image_free(image);
@@ -201,6 +203,7 @@ int main() {
         free(addernet_kernel);
     }
     printf("Execution took %3.5f ms \n", total_time);
+    printf("AVG: %3.5f ms \n", total_time / num_of_runs);
 
     return 0;
 }
@@ -269,93 +272,93 @@ addernetCUDA(uint8_t *out_img, uint8_t *img, uint8_t *addernet_kernel, const int
     addernetKernel <<<grid, block >>>(dev_out, texObj, kernel_radius, img_width, img_length);
     gpuErrchk(cudaGetLastError())
 
-    int n_blocks = 0;
-    long *mean_h, *var_h;
-    long *mean_d, *var_d;
-
-
-    size_t tot_size_1 = width * height * sizeof(long);
-    cudaMalloc((void **) &mean_d, tot_size_1);
-    cudaMalloc((void **) &var_d, tot_size_1);
-    cudaMemset(mean_d, 0, tot_size_1);
-    cudaMemset(var_d, 0, tot_size_1);
-    for (int i = 0; i < width * height; i++) {
-        cudaMemcpy(mean_d + i, dev_out, 1, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(var_d + i, dev_out, 1, cudaMemcpyDeviceToDevice);
-    }
-    mean_h = (long *) malloc(sizeof(long));
-    var_h = (long *) malloc(sizeof(long));
-    int N = height * width;
-    do {
-        long *mean_temp_d;
-
-        int block_size = min(GPUTHREADSIZE, N);
-        n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
-        size_t count = n_blocks * sizeof(long);
-        gpuErrchk(cudaMalloc((void **) &mean_temp_d, count));
-//        gpuErrchk(cudaMalloc((void **) &min_temp_d, count));
-        gpuErrchk(cudaMemset(mean_temp_d, 0, count));
-//        cudaMemset(min_temp_d, 255, count);
-        size_t i = block_size * sizeof(long);
-        mat_mean<<< n_blocks, block_size, i>>>(mean_d, mean_temp_d, N);
-        gpuErrchk(cudaGetLastError())
-//        mat_min <<< n_blocks, block_size, block_size >>>(min_d, min_temp_d, N);
-//        err = cudaGetLastError();
-//        gpuErrchk(err)
-        cudaDeviceSynchronize();
-//        gpuErrchk(cudaMemcpy(min_d, min_temp_d, count, cudaMemcpyDeviceToDevice));
-        gpuErrchk(cudaMemcpy(mean_d, mean_temp_d, count, cudaMemcpyDeviceToDevice));
-        cudaDeviceSynchronize();
-
-//        gpuErrchk(cudaFree(min_temp_d));
-        gpuErrchk(cudaFree(mean_temp_d));
-        N = n_blocks;
-    } while (n_blocks != 1);
-    cudaMemcpy(mean_h, mean_d, sizeof(long), cudaMemcpyDeviceToHost);
-//    cudaMemcpy(var_h, min_d, sizeof(long), cudaMemcpyDeviceToHost);
-    N = width * height;
-    *mean_h = *mean_h / N;
-    printf("mean: %d\n", *mean_h);
-    int block_size = min(GPUTHREADSIZE, N);
-    n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
-    square_sum<<< n_blocks, block_size>>>(dev_out, var_d, *mean_h, N);
-
-    do {
-        long *mean_temp_d;
-
-        block_size = min(GPUTHREADSIZE, N);
-        n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
-        size_t count = n_blocks * sizeof(long);
-        gpuErrchk(cudaMalloc((void **) &mean_temp_d, count));
-//        gpuErrchk(cudaMalloc((void **) &min_temp_d, count));
-        gpuErrchk(cudaMemset(mean_temp_d, 0, count));
-//        cudaMemset(min_temp_d, 255, count);
-        size_t i = block_size * sizeof(long);
-        mat_mean<<< n_blocks, block_size, i>>>(var_d, mean_temp_d, N);
-        gpuErrchk(cudaGetLastError())
-//        mat_min <<< n_blocks, block_size, block_size >>>(min_d, min_temp_d, N);
-//        err = cudaGetLastError();
-//        gpuErrchk(err)
-        cudaDeviceSynchronize();
-//        gpuErrchk(cudaMemcpy(min_d, min_temp_d, count, cudaMemcpyDeviceToDevice));
-        gpuErrchk(cudaMemcpy(var_d, mean_temp_d, count, cudaMemcpyDeviceToDevice));
-        cudaDeviceSynchronize();
-
-//        gpuErrchk(cudaFree(min_temp_d));
-        gpuErrchk(cudaFree(mean_temp_d));
-        N = n_blocks;
-    } while (n_blocks != 1);
-    cudaMemcpy(var_h, var_d, sizeof(long), cudaMemcpyDeviceToHost);
-//    cudaMemcpy(var_h, min_d, sizeof(long), cudaMemcpyDeviceToHost);
-    N = width * height;
-    printf("var: %d\n", *var_h);
-    *var_h = *var_h / N;
-    printf("var: %d\n", *var_h);
-
-    N = width * height;
-    block_size = min(GPUTHREADSIZE, N);
-    n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
-    normalize<<< n_blocks, block_size>>>(dev_out, dev_out, *mean_h, *var_h, N);
+//    int n_blocks = 0;
+//    long *mean_h, *var_h;
+//    long *mean_d, *var_d;
+//
+//
+//    size_t tot_size_1 = width * height * sizeof(long);
+//    cudaMalloc((void **) &mean_d, tot_size_1);
+//    cudaMalloc((void **) &var_d, tot_size_1);
+//    cudaMemset(mean_d, 0, tot_size_1);
+//    cudaMemset(var_d, 0, tot_size_1);
+//    for (int i = 0; i < width * height; i++) {
+//        cudaMemcpy(mean_d + i, dev_out, 1, cudaMemcpyDeviceToDevice);
+//        cudaMemcpy(var_d + i, dev_out, 1, cudaMemcpyDeviceToDevice);
+//    }
+//    mean_h = (long *) malloc(sizeof(long));
+//    var_h = (long *) malloc(sizeof(long));
+//    int N = height * width;
+//    do {
+//        long *mean_temp_d;
+//
+//        int block_size = min(GPUTHREADSIZE, N);
+//        n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+//        size_t count = n_blocks * sizeof(long);
+//        gpuErrchk(cudaMalloc((void **) &mean_temp_d, count));
+////        gpuErrchk(cudaMalloc((void **) &min_temp_d, count));
+//        gpuErrchk(cudaMemset(mean_temp_d, 0, count));
+////        cudaMemset(min_temp_d, 255, count);
+//        size_t i = block_size * sizeof(long);
+//        mat_mean<<< n_blocks, block_size, i>>>(mean_d, mean_temp_d, N);
+//        gpuErrchk(cudaGetLastError())
+////        mat_min <<< n_blocks, block_size, block_size >>>(min_d, min_temp_d, N);
+////        err = cudaGetLastError();
+////        gpuErrchk(err)
+//        cudaDeviceSynchronize();
+////        gpuErrchk(cudaMemcpy(min_d, min_temp_d, count, cudaMemcpyDeviceToDevice));
+//        gpuErrchk(cudaMemcpy(mean_d, mean_temp_d, count, cudaMemcpyDeviceToDevice));
+//        cudaDeviceSynchronize();
+//
+////        gpuErrchk(cudaFree(min_temp_d));
+//        gpuErrchk(cudaFree(mean_temp_d));
+//        N = n_blocks;
+//    } while (n_blocks != 1);
+//    cudaMemcpy(mean_h, mean_d, sizeof(long), cudaMemcpyDeviceToHost);
+////    cudaMemcpy(var_h, min_d, sizeof(long), cudaMemcpyDeviceToHost);
+//    N = width * height;
+//    *mean_h = *mean_h / N;
+//    printf("mean: %d\n", *mean_h);
+//    int block_size = min(GPUTHREADSIZE, N);
+//    n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+//    square_sum<<< n_blocks, block_size>>>(dev_out, var_d, *mean_h, N);
+//
+//    do {
+//        long *mean_temp_d;
+//
+//        block_size = min(GPUTHREADSIZE, N);
+//        n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+//        size_t count = n_blocks * sizeof(long);
+//        gpuErrchk(cudaMalloc((void **) &mean_temp_d, count));
+////        gpuErrchk(cudaMalloc((void **) &min_temp_d, count));
+//        gpuErrchk(cudaMemset(mean_temp_d, 0, count));
+////        cudaMemset(min_temp_d, 255, count);
+//        size_t i = block_size * sizeof(long);
+//        mat_mean<<< n_blocks, block_size, i>>>(var_d, mean_temp_d, N);
+//        gpuErrchk(cudaGetLastError())
+////        mat_min <<< n_blocks, block_size, block_size >>>(min_d, min_temp_d, N);
+////        err = cudaGetLastError();
+////        gpuErrchk(err)
+//        cudaDeviceSynchronize();
+////        gpuErrchk(cudaMemcpy(min_d, min_temp_d, count, cudaMemcpyDeviceToDevice));
+//        gpuErrchk(cudaMemcpy(var_d, mean_temp_d, count, cudaMemcpyDeviceToDevice));
+//        cudaDeviceSynchronize();
+//
+////        gpuErrchk(cudaFree(min_temp_d));
+//        gpuErrchk(cudaFree(mean_temp_d));
+//        N = n_blocks;
+//    } while (n_blocks != 1);
+//    cudaMemcpy(var_h, var_d, sizeof(long), cudaMemcpyDeviceToHost);
+////    cudaMemcpy(var_h, min_d, sizeof(long), cudaMemcpyDeviceToHost);
+//    N = width * height;
+//    printf("var: %d\n", *var_h);
+//    *var_h = *var_h / N;
+//    printf("var: %d\n", *var_h);
+//
+//    N = width * height;
+//    block_size = min(GPUTHREADSIZE, N);
+//    n_blocks = N / block_size + (N % block_size == 0 ? 0 : 1);
+//    normalize<<< n_blocks, block_size>>>(dev_out, dev_out, *mean_h, *var_h, N);
 
     // Copy output vector from GPU buffer to host memory.
     cudaStatus = cudaMemcpy(out_img, dev_out,
