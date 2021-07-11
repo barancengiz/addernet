@@ -50,7 +50,7 @@ int main() {
 
     int num_of_runs = 10;
     for (int run = 0; run < num_of_runs; run++) {
-        uint8_t *image = stbi_load("../CudaRuntime1/samples/5184x3456.bmp", &width, &height, &bpp, NUM_CHANNELS);
+        uint8_t *image = stbi_load("../CudaRuntime1/samples/640x426.bmp", &width, &height, &bpp, NUM_CHANNELS);
 
         // Print for sanity check
         printf("Bytes per pixel: %d \n", bpp / 3); //Image is grayscale, so bpp / 3;
@@ -86,7 +86,7 @@ int main() {
         total_time += msecs;
         printf("\n");
 
-        stbi_write_bmp("./out_img_5184x3456_cpu.bmp", width - 2 * kernel_radius, height - 2 * kernel_radius, 1,
+        stbi_write_bmp("./out_img_640x426_cpu.bmp", width - 2 * kernel_radius, height - 2 * kernel_radius, 1,
                        out_image);
 
         // Deallocate memory
